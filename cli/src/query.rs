@@ -34,7 +34,9 @@ pub fn query_files_at_paths(
         let tree = parser.parse(&source_code, None).unwrap();
 
         if ordered_captures {
-            for (pattern_index, capture) in query_cursor.captures(&query, tree.root_node(), text_callback) {
+            for (pattern_index, capture) in
+                query_cursor.captures(&query, tree.root_node(), text_callback)
+            {
                 writeln!(
                     &mut stdout,
                     "    pattern: {}, capture: {}, row: {}, text: {:?}",

@@ -1,15 +1,15 @@
 pub mod c_lib;
 pub mod util;
-
 pub use c_lib as c;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use serde_derive::*;
-use std::mem::transmute;
+
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::{cmp, fmt, str, usize};
-use tree_sitter::{Language, Node, Parser, Point, PropertySheet, Range, Tree, TreePropertyCursor};
+use std::{iter, mem, ops, str, usize};
+use tree_sitter::{Language, Parser, Query, QueryCapture, QueryCursor, QueryError, Tree};
 
 const CANCELLATION_CHECK_INTERVAL: usize = 100;
+
+#[derive(Copy, Clone, Debug)]
+pub struct Highlight(pub usize);
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Error {
@@ -19,104 +19,10 @@ pub enum Error {
 }
 
 #[derive(Debug)]
-enum TreeStep {
-    Child {
-        index: isize,
-        kinds: Option<Vec<u16>>,
-    },
-    Children {
-        kinds: Option<Vec<u16>>,
-    },
-    Next {
-        kinds: Option<Vec<u16>>,
-    },
-}
-
-#[derive(Debug)]
-enum InjectionLanguage {
-    Literal(String),
-    TreePath(Vec<TreeStep>),
-}
-
-#[derive(Debug)]
-struct Injection {
-    language: InjectionLanguage,
-    content: Vec<TreeStep>,
-    includes_children: bool,
-}
-
-#[derive(Debug)]
-pub struct Properties {
-    highlight: Option<Highlight>,
-    highlight_nonlocal: Option<Highlight>,
-    injections: Vec<Injection>,
-    local_scope: Option<bool>,
-    local_definition: bool,
-    local_reference: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-#[repr(u16)]
-pub enum Highlight {
-    Attribute,
-    Comment,
-    Constant,
-    ConstantBuiltin,
-    Constructor,
-    ConstructorBuiltin,
-    Embedded,
-    Escape,
-    Function,
-    FunctionBuiltin,
-    Keyword,
-    Number,
-    Operator,
-    Property,
-    PropertyBuiltin,
-    Punctuation,
-    PunctuationBracket,
-    PunctuationDelimiter,
-    PunctuationSpecial,
-    String,
-    StringSpecial,
-    Tag,
-    Type,
-    TypeBuiltin,
-    Variable,
-    VariableBuiltin,
-    VariableParameter,
-    Unknown,
-}
-
-#[derive(Debug)]
-struct Scope<'a> {
+struct LocalScope<'a> {
     inherits: bool,
-    local_defs: Vec<(&'a str, Highlight)>,
-}
-
-struct Layer<'a> {
-    _tree: Tree,
-    cursor: TreePropertyCursor<'a, Properties>,
-    ranges: Vec<Range>,
-    at_node_end: bool,
-    depth: usize,
-    opaque: bool,
-    scope_stack: Vec<Scope<'a>>,
-    local_highlight: Option<Highlight>,
-}
-
-struct Highlighter<'a, T>
-where
-    T: Fn(&str) -> Option<(Language, &'a PropertySheet<Properties>)>,
-{
-    injection_callback: T,
-    source: &'a [u8],
-    source_offset: usize,
-    parser: Parser,
-    layers: Vec<Layer<'a>>,
-    max_opaque_layer_depth: usize,
-    operation_count: usize,
-    cancellation_flag: Option<&'a AtomicUsize>,
+    range: ops::Range<usize>,
+    local_defs: Vec<(&'a str, Option<Highlight>)>,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -126,986 +32,403 @@ pub enum HighlightEvent {
     HighlightEnd,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum TreePathArgJSON {
-    TreePath(TreePathJSON),
-    Number(isize),
-    String(String),
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "name")]
-enum TreePathJSON {
-    #[serde(rename = "this")]
-    This,
-    #[serde(rename = "child")]
-    Child { args: Vec<TreePathArgJSON> },
-    #[serde(rename = "next")]
-    Next { args: Vec<TreePathArgJSON> },
-    #[serde(rename = "children")]
-    Children { args: Vec<TreePathArgJSON> },
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum InjectionLanguageJSON {
-    List(Vec<InjectionLanguageJSON>),
-    TreePath(TreePathJSON),
-    Literal(String),
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum InjectionContentJSON {
-    List(Vec<InjectionContentJSON>),
-    TreePath(TreePathJSON),
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum InjectionIncludesChildrenJSON {
-    List(Vec<bool>),
-    Single(bool),
-}
-
-#[derive(Debug, Deserialize)]
-struct PropertiesJSON {
-    highlight: Option<Highlight>,
-    #[serde(rename = "highlight-nonlocal")]
-    highlight_nonlocal: Option<Highlight>,
-
-    #[serde(rename = "injection-language")]
-    injection_language: Option<InjectionLanguageJSON>,
-    #[serde(rename = "injection-content")]
-    injection_content: Option<InjectionContentJSON>,
-    #[serde(default, rename = "injection-includes-children")]
-    injection_includes_children: Option<InjectionIncludesChildrenJSON>,
-
-    #[serde(default, rename = "local-scope")]
-    local_scope: bool,
-    #[serde(default, rename = "local-scope-inherit")]
-    local_scope_inherit: bool,
-    #[serde(default, rename = "local-definition")]
-    local_definition: bool,
-    #[serde(default, rename = "local-reference")]
-    local_reference: bool,
-}
-
-#[derive(Debug)]
-pub enum PropertySheetError {
-    InvalidJSON(serde_json::Error),
-    InvalidRegex(regex::Error),
-    InvalidFormat(String),
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            Error::Cancelled => write!(f, "Cancelled"),
-            Error::InvalidLanguage => write!(f, "Invalid language"),
-            Error::Unknown => write!(f, "Unknown error"),
-        }
-    }
-}
-
-impl fmt::Display for PropertySheetError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            PropertySheetError::InvalidJSON(e) => e.fmt(f),
-            PropertySheetError::InvalidRegex(e) => e.fmt(f),
-            PropertySheetError::InvalidFormat(e) => e.fmt(f),
-        }
-    }
-}
-
-impl<'a> fmt::Debug for Layer<'a> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(
-            f,
-            "Layer {{ at_node_end: {}, node: {:?} }}",
-            self.at_node_end,
-            self.cursor.node()
-        )?;
-        Ok(())
-    }
-}
-
-pub fn load_property_sheet(
+pub struct HighlightConfiguration {
     language: Language,
-    json: &str,
-) -> Result<PropertySheet<Properties>, PropertySheetError> {
-    let sheet = PropertySheet::new(language, json).map_err(|e| match e {
-        tree_sitter::PropertySheetError::InvalidJSON(e) => PropertySheetError::InvalidJSON(e),
-        tree_sitter::PropertySheetError::InvalidRegex(e) => PropertySheetError::InvalidRegex(e),
-    })?;
-    let sheet = sheet
-        .map(|p| Properties::new(p, language))
-        .map_err(PropertySheetError::InvalidFormat)?;
-    Ok(sheet)
+    query: Query,
+    locals_pattern_index: usize,
+    highlights_pattern_index: usize,
+    highlight_indices: Vec<Option<Highlight>>,
+    non_local_variable_patterns: Vec<bool>,
 }
 
-impl Highlight {
-    pub fn from_usize(i: usize) -> Option<Self> {
-        if i <= (Highlight::Unknown as usize) {
-            Some(unsafe { transmute(i as u16) })
-        } else {
-            None
-        }
-    }
+#[derive(Clone, Debug)]
+pub struct Highlighter {
+    pub highlight_names: Vec<String>,
 }
 
-impl Properties {
-    fn new(json: PropertiesJSON, language: Language) -> Result<Self, String> {
-        let injections = match (json.injection_language, json.injection_content) {
-            (None, None) => Ok(Vec::new()),
-            (Some(_), None) => Err(
-                "Must specify an injection-content along with an injection-language".to_string(),
-            ),
-            (None, Some(_)) => Err(
-                "Must specify an injection-language along with an injection-content".to_string(),
-            ),
-            (Some(language_json), Some(content_json)) => {
-                let languages = match language_json {
-                    InjectionLanguageJSON::List(list) => {
-                        let mut result = Vec::with_capacity(list.len());
-                        for element in list {
-                            result.push(match element {
-                                InjectionLanguageJSON::TreePath(p) => {
-                                    let mut result = Vec::new();
-                                    Self::flatten_tree_path(p, &mut result, language)?;
-                                    InjectionLanguage::TreePath(result)
-                                }
-                                InjectionLanguageJSON::Literal(s) => InjectionLanguage::Literal(s),
-                                InjectionLanguageJSON::List(_) => {
-                                    panic!("Injection-language cannot be a list of lists")
-                                }
-                            })
-                        }
-                        result
-                    }
-                    InjectionLanguageJSON::TreePath(p) => vec![{
-                        let mut result = Vec::new();
-                        Self::flatten_tree_path(p, &mut result, language)?;
-                        InjectionLanguage::TreePath(result)
-                    }],
-                    InjectionLanguageJSON::Literal(s) => vec![InjectionLanguage::Literal(s)],
-                };
-
-                let contents = match content_json {
-                    InjectionContentJSON::List(l) => {
-                        let mut result = Vec::with_capacity(l.len());
-                        for element in l {
-                            result.push(match element {
-                                InjectionContentJSON::TreePath(p) => {
-                                    let mut result = Vec::new();
-                                    Self::flatten_tree_path(p, &mut result, language)?;
-                                    result
-                                }
-                                InjectionContentJSON::List(_) => {
-                                    panic!("Injection-content cannot be a list of lists")
-                                }
-                            })
-                        }
-                        result
-                    }
-                    InjectionContentJSON::TreePath(p) => vec![{
-                        let mut result = Vec::new();
-                        Self::flatten_tree_path(p, &mut result, language)?;
-                        result
-                    }],
-                };
-
-                let mut includes_children = match json.injection_includes_children {
-                    Some(InjectionIncludesChildrenJSON::List(v)) => v,
-                    Some(InjectionIncludesChildrenJSON::Single(v)) => vec![v],
-                    None => vec![false],
-                };
-
-                if languages.len() == contents.len() {
-                    includes_children.resize(languages.len(), includes_children[0]);
-                    Ok(languages
-                        .into_iter()
-                        .zip(contents.into_iter())
-                        .zip(includes_children.into_iter())
-                        .map(|((language, content), includes_children)| Injection {
-                            language,
-                            content,
-                            includes_children,
-                        })
-                        .collect())
-                } else {
-                    Err(format!(
-                        "Mismatch: got {} injection-language values but {} injection-content values",
-                        languages.len(),
-                        contents.len(),
-                    ))
-                }
-            }
-        }?;
-
-        Ok(Self {
-            highlight: json.highlight,
-            highlight_nonlocal: json.highlight_nonlocal,
-            local_scope: if json.local_scope {
-                Some(json.local_scope_inherit)
-            } else {
-                None
-            },
-            local_definition: json.local_definition,
-            local_reference: json.local_reference,
-            injections,
-        })
-    }
-
-    // Transform a tree path from the format expressed directly in the property sheet
-    // (nested function calls), to a flat sequence of steps for transforming a list of
-    // nodes. This way, we can evaluate these tree paths with no recursion and a single
-    // vector of intermediate storage.
-    fn flatten_tree_path(
-        p: TreePathJSON,
-        steps: &mut Vec<TreeStep>,
-        language: Language,
-    ) -> Result<(), String> {
-        match p {
-            TreePathJSON::This => {}
-            TreePathJSON::Child { args } => {
-                let (tree_path, index, kinds) = Self::parse_args("child", args, language)?;
-                Self::flatten_tree_path(tree_path, steps, language)?;
-                steps.push(TreeStep::Child {
-                    index: index
-                        .ok_or_else(|| "The `child` function requires an index".to_string())?,
-                    kinds: kinds,
-                });
-            }
-            TreePathJSON::Children { args } => {
-                let (tree_path, _, kinds) = Self::parse_args("children", args, language)?;
-                Self::flatten_tree_path(tree_path, steps, language)?;
-                steps.push(TreeStep::Children { kinds });
-            }
-            TreePathJSON::Next { args } => {
-                let (tree_path, _, kinds) = Self::parse_args("next", args, language)?;
-                Self::flatten_tree_path(tree_path, steps, language)?;
-                steps.push(TreeStep::Next { kinds });
-            }
-        }
-        Ok(())
-    }
-
-    fn parse_args(
-        name: &str,
-        args: Vec<TreePathArgJSON>,
-        language: Language,
-    ) -> Result<(TreePathJSON, Option<isize>, Option<Vec<u16>>), String> {
-        let tree_path;
-        let mut index = None;
-        let mut kinds = Vec::new();
-        let mut iter = args.into_iter();
-
-        match iter.next() {
-            Some(TreePathArgJSON::TreePath(p)) => tree_path = p,
-            _ => {
-                return Err(format!(
-                    "First argument to `{}()` must be a tree path",
-                    name
-                ));
-            }
-        }
-
-        for arg in iter {
-            match arg {
-                TreePathArgJSON::TreePath(_) => {
-                    return Err(format!(
-                        "Other arguments to `{}()` must be strings or numbers",
-                        name
-                    ));
-                }
-                TreePathArgJSON::Number(i) => index = Some(i),
-                TreePathArgJSON::String(s) => kinds.push(s),
-            }
-        }
-
-        if kinds.len() > 0 {
-            let mut kind_ids = Vec::new();
-            for i in 0..(language.node_kind_count() as u16) {
-                if kinds.iter().any(|s| s == language.node_kind_for_id(i))
-                    && language.node_kind_is_named(i)
-                {
-                    kind_ids.push(i);
-                }
-            }
-            if kind_ids.len() == 0 {
-                return Err(format!("Non-existent node kinds: {:?}", kinds));
-            }
-
-            Ok((tree_path, index, Some(kind_ids)))
-        } else {
-            Ok((tree_path, index, None))
-        }
-    }
+pub struct HighlightContext {
+    parser: Parser,
+    cursors: Vec<QueryCursor>,
 }
 
-impl<'a, F> Highlighter<'a, F>
+struct HighlightIter<'a, F, C>
 where
-    F: Fn(&str) -> Option<(Language, &'a PropertySheet<Properties>)>,
+    F: Fn(&str) -> Option<&'a HighlightConfiguration> + 'a,
+    C: Iterator<Item = (usize, QueryCapture<'a>)>,
 {
-    fn new(
-        source: &'a [u8],
-        language: Language,
-        property_sheet: &'a PropertySheet<Properties>,
-        injection_callback: F,
-        cancellation_flag: Option<&'a AtomicUsize>,
-    ) -> Result<Self, Error> {
-        let mut parser = Parser::new();
-        unsafe { parser.set_cancellation_flag(cancellation_flag.clone()) };
-        parser
-            .set_language(language)
-            .map_err(|_| Error::InvalidLanguage)?;
-        let tree = parser.parse(source, None).ok_or_else(|| Error::Cancelled)?;
-        Ok(Self {
-            parser,
-            source,
-            cancellation_flag,
-            injection_callback,
-            source_offset: 0,
-            operation_count: 0,
-            max_opaque_layer_depth: 0,
-            layers: vec![Layer::new(
-                source,
-                tree,
-                property_sheet,
-                vec![Range {
-                    start_byte: 0,
-                    end_byte: usize::MAX,
-                    start_point: Point::new(0, 0),
-                    end_point: Point::new(usize::MAX, usize::MAX),
-                }],
-                0,
-                true,
-            )],
-        })
-    }
+    context: &'a mut HighlightContext,
+    _tree: Tree,
+    cursor: Option<QueryCursor>,
+    captures: iter::Peekable<C>,
+    config: &'a HighlightConfiguration,
+    source: &'a [u8],
+    cancellation_flag: Option<&'a AtomicUsize>,
+    injection_callback: F,
+    byte_offset: usize,
+    iter_count: usize,
+    local_scope_capture_index: Option<usize>,
+    local_def_capture_index: Option<usize>,
+    local_ref_capture_index: Option<usize>,
+    highlight_end_stack: Vec<usize>,
+    scope_stack: Vec<LocalScope<'a>>,
+    next_event: Option<HighlightEvent>,
+}
 
-    fn emit_source(&mut self, next_offset: usize) -> HighlightEvent {
-        let result = HighlightEvent::Source {
-            start: self.source_offset,
-            end: next_offset,
-        };
-        self.source_offset = next_offset;
-        result
-    }
-
-    fn process_tree_step(&self, step: &TreeStep, nodes: &mut Vec<Node>) {
-        let len = nodes.len();
-        for i in 0..len {
-            let node = nodes[i];
-            match step {
-                TreeStep::Child { index, kinds } => {
-                    let index = if *index >= 0 {
-                        *index as usize
-                    } else {
-                        (node.child_count() as isize + *index) as usize
-                    };
-                    if let Some(child) = node.child(index) {
-                        if let Some(kinds) = kinds {
-                            if kinds.contains(&child.kind_id()) {
-                                nodes.push(child);
-                            }
-                        } else {
-                            nodes.push(child);
-                        }
-                    }
-                }
-                TreeStep::Children { kinds } => {
-                    for child in node.children() {
-                        if let Some(kinds) = kinds {
-                            if kinds.contains(&child.kind_id()) {
-                                nodes.push(child);
-                            }
-                        } else {
-                            nodes.push(child);
-                        }
-                    }
-                }
-                TreeStep::Next { .. } => unimplemented!(),
-            }
-        }
-        nodes.drain(0..len);
-    }
-
-    fn nodes_for_tree_path(&self, node: Node<'a>, steps: &Vec<TreeStep>) -> Vec<Node<'a>> {
-        let mut nodes = vec![node];
-        for step in steps.iter() {
-            self.process_tree_step(step, &mut nodes);
-        }
-        nodes
-    }
-
-    // An injected language name may either be specified as a fixed string, or based
-    // on the text of some node in the syntax tree.
-    fn injection_language_string(
-        &self,
-        node: &Node<'a>,
-        language: &InjectionLanguage,
-    ) -> Option<String> {
-        match language {
-            InjectionLanguage::Literal(s) => Some(s.to_string()),
-            InjectionLanguage::TreePath(steps) => self
-                .nodes_for_tree_path(*node, steps)
-                .first()
-                .and_then(|node| {
-                    str::from_utf8(&self.source[node.start_byte()..node.end_byte()])
-                        .map(|s| s.to_owned())
-                        .ok()
-                }),
-        }
-    }
-
-    // Compute the ranges that should be included when parsing an injection.
-    // This takes into account three things:
-    // * `parent_ranges` - The new injection may be nested inside of *another* injection
-    //   (e.g. JavaScript within HTML within ERB). The parent injection's ranges must
-    //   be taken into account.
-    // * `nodes` - Every injection takes place within a set of nodes. The injection ranges
-    //   are the ranges of those nodes.
-    // * `includes_children` - For some injections, the content nodes' children should be
-    //   excluded from the nested document, so that only the content nodes' *own* content
-    //   is reparsed. For other injections, the content nodes' entire ranges should be
-    //   reparsed, including the ranges of their children.
-    fn intersect_ranges(
-        parent_ranges: &Vec<Range>,
-        nodes: &Vec<Node>,
-        includes_children: bool,
-    ) -> Vec<Range> {
-        let mut result = Vec::new();
-        let mut parent_range_iter = parent_ranges.iter();
-        let mut parent_range = parent_range_iter
-            .next()
-            .expect("Layers should only be constructed with non-empty ranges vectors");
-        for node in nodes.iter() {
-            let mut preceding_range = Range {
-                start_byte: 0,
-                start_point: Point::new(0, 0),
-                end_byte: node.start_byte(),
-                end_point: node.start_position(),
-            };
-            let following_range = Range {
-                start_byte: node.end_byte(),
-                start_point: node.end_position(),
-                end_byte: usize::MAX,
-                end_point: Point::new(usize::MAX, usize::MAX),
-            };
-
-            for excluded_range in node
-                .children()
-                .filter_map(|child| {
-                    if includes_children {
-                        None
-                    } else {
-                        Some(child.range())
-                    }
-                })
-                .chain([following_range].iter().cloned())
-            {
-                let mut range = Range {
-                    start_byte: preceding_range.end_byte,
-                    start_point: preceding_range.end_point,
-                    end_byte: excluded_range.start_byte,
-                    end_point: excluded_range.start_point,
-                };
-                preceding_range = excluded_range;
-
-                if range.end_byte < parent_range.start_byte {
-                    continue;
-                }
-
-                while parent_range.start_byte <= range.end_byte {
-                    if parent_range.end_byte > range.start_byte {
-                        if range.start_byte < parent_range.start_byte {
-                            range.start_byte = parent_range.start_byte;
-                            range.start_point = parent_range.start_point;
-                        }
-
-                        if parent_range.end_byte < range.end_byte {
-                            if range.start_byte < parent_range.end_byte {
-                                result.push(Range {
-                                    start_byte: range.start_byte,
-                                    start_point: range.start_point,
-                                    end_byte: parent_range.end_byte,
-                                    end_point: parent_range.end_point,
-                                });
-                            }
-                            range.start_byte = parent_range.end_byte;
-                            range.start_point = parent_range.end_point;
-                        } else {
-                            if range.start_byte < range.end_byte {
-                                result.push(range);
-                            }
-                            break;
-                        }
-                    }
-
-                    if let Some(next_range) = parent_range_iter.next() {
-                        parent_range = next_range;
-                    } else {
-                        return result;
-                    }
-                }
-            }
-        }
-        result
-    }
-
-    fn add_layer(
-        &mut self,
-        language_string: &str,
-        ranges: Vec<Range>,
-        depth: usize,
-        includes_children: bool,
-    ) -> Option<Error> {
-        if let Some((language, property_sheet)) = (self.injection_callback)(language_string) {
-            if self.parser.set_language(language).is_err() {
-                return Some(Error::InvalidLanguage);
-            }
-            self.parser.set_included_ranges(&ranges);
-            if let Some(tree) = self.parser.parse(self.source, None) {
-                let layer = Layer::new(
-                    self.source,
-                    tree,
-                    property_sheet,
-                    ranges,
-                    depth,
-                    includes_children,
-                );
-                if includes_children && depth > self.max_opaque_layer_depth {
-                    self.max_opaque_layer_depth = depth;
-                }
-                match self.layers.binary_search_by(|l| l.cmp(&layer)) {
-                    Ok(i) | Err(i) => self.layers.insert(i, layer),
-                };
-            } else {
-                return Some(Error::Cancelled);
-            }
-        }
-        None
-    }
-
-    fn remove_first_layer(&mut self) {
-        let layer = self.layers.remove(0);
-        if layer.opaque && layer.depth == self.max_opaque_layer_depth {
-            self.max_opaque_layer_depth = self
-                .layers
-                .iter()
-                .filter_map(|l| if l.opaque { Some(l.depth) } else { None })
-                .max()
-                .unwrap_or(0);
+impl HighlightContext {
+    pub fn new() -> Self {
+        HighlightContext {
+            parser: Parser::new(),
+            cursors: Vec::new(),
         }
     }
 }
 
-impl<'a, T> Iterator for Highlighter<'a, T>
+impl Highlighter {
+    pub fn new(highlight_names: Vec<String>) -> Self {
+        Highlighter { highlight_names }
+    }
+
+    pub fn load_configuration(
+        &self,
+        language: Language,
+        highlights_query: &str,
+        injection_query: &str,
+        locals_query: &str,
+    ) -> Result<HighlightConfiguration, QueryError> {
+        // Concatenate the query strings, keeping track of the start offset of each section.
+        let mut query_source = String::new();
+        query_source.push_str(injection_query);
+        let locals_query_offset = query_source.len();
+        query_source.push_str(locals_query);
+        let highlights_query_offset = query_source.len();
+        query_source.push_str(highlights_query);
+
+        // Construct a query with the concatenated string.
+        let query = Query::new(language, &query_source)?;
+
+        // Determine the range of pattern indices that belong to each section of the query.
+        let mut locals_pattern_index = 0;
+        let mut highlights_pattern_index = 0;
+        for i in 0..(query.pattern_count()) {
+            let pattern_offset = query.start_byte_for_pattern(i);
+            if pattern_offset < highlights_query_offset {
+                if pattern_offset < highlights_query_offset {
+                    highlights_pattern_index += 1;
+                }
+                if pattern_offset < locals_query_offset {
+                    locals_pattern_index += 1;
+                }
+            }
+        }
+
+        // Compute a mapping from the query's capture ids to the indices of the highlighter's
+        // recognized highlight names.
+        let highlight_indices = query
+            .capture_names()
+            .iter()
+            .map(move |capture_name| {
+                let mut best_index = None;
+                let mut best_name_len = 0;
+                let mut best_common_prefix_len = 0;
+                for (i, highlight_name) in self.highlight_names.iter().enumerate() {
+                    if highlight_name.len() > capture_name.len() {
+                        continue;
+                    }
+
+                    let capture_parts = capture_name.split('.');
+                    let highlight_parts = highlight_name.split('.');
+                    let common_prefix_len = capture_parts
+                        .zip(highlight_parts)
+                        .take_while(|(a, b)| a == b)
+                        .count();
+                    let is_best_match = common_prefix_len > best_common_prefix_len
+                        || (common_prefix_len == best_common_prefix_len
+                            && highlight_name.len() < best_name_len);
+                    if is_best_match {
+                        best_index = Some(i);
+                        best_name_len = highlight_name.len();
+                        best_common_prefix_len = common_prefix_len;
+                    }
+                }
+                best_index.map(Highlight)
+            })
+            .collect();
+
+        let non_local_variable_patterns = (0..query.pattern_count())
+            .map(|i| {
+                query
+                    .property_predicates(i)
+                    .iter()
+                    .any(|(prop, positive)| !*positive && prop.key.as_ref() == "local")
+            })
+            .collect();
+
+        Ok(HighlightConfiguration {
+            query,
+            language,
+            locals_pattern_index,
+            highlights_pattern_index,
+            highlight_indices,
+            non_local_variable_patterns,
+        })
+    }
+
+    pub fn highlight<'a>(
+        &'a self,
+        context: &'a mut HighlightContext,
+        config: &'a HighlightConfiguration,
+        source: &'a [u8],
+        cancellation_flag: Option<&'a AtomicUsize>,
+        injection_callback: impl Fn(&str) -> Option<&'a HighlightConfiguration> + 'a,
+    ) -> Result<impl Iterator<Item = Result<HighlightEvent, Error>> + 'a, Error> {
+        context
+            .parser
+            .set_language(config.language)
+            .map_err(|_| Error::InvalidLanguage)?;
+        unsafe { context.parser.set_cancellation_flag(cancellation_flag) };
+        let tree = context.parser.parse(source, None).ok_or(Error::Cancelled)?;
+        let capture_names = config.query.capture_names();
+
+        let mut cursor = context.cursors.pop().unwrap_or(QueryCursor::new());
+
+        // The `captures` iterator borrows the `Tree` and the `QueryCursor`, which
+        // prevents them from being moved. But both of these values are really just
+        // pointers, so it's actually ok to move them.
+        let tree_ref = unsafe { mem::transmute::<_, &'static Tree>(&tree) };
+        let cursor_ref = unsafe { mem::transmute::<_, &'static mut QueryCursor>(&mut cursor) };
+        let captures = cursor_ref
+            .captures(&config.query, tree_ref.root_node(), move |n| {
+                &source[n.byte_range()]
+            })
+            .peekable();
+
+        Ok(HighlightIter {
+            local_scope_capture_index: capture_names.iter().position(|c| c == "local.scope"),
+            local_def_capture_index: capture_names.iter().position(|c| c == "local.definition"),
+            local_ref_capture_index: capture_names.iter().position(|c| c == "local.reference"),
+            byte_offset: 0,
+            iter_count: 0,
+            next_event: None,
+            highlight_end_stack: Vec::new(),
+            scope_stack: vec![LocalScope {
+                inherits: false,
+                range: 0..usize::MAX,
+                local_defs: Vec::new(),
+            }],
+            cursor: Some(cursor),
+            _tree: tree,
+            captures,
+            cancellation_flag,
+            source,
+            config,
+            injection_callback,
+            context,
+        })
+    }
+}
+
+impl<'a, F, C> HighlightIter<'a, F, C>
 where
-    T: Fn(&str) -> Option<(Language, &'a PropertySheet<Properties>)>,
+    F: Fn(&str) -> Option<&'a HighlightConfiguration> + 'a,
+    C: Iterator<Item = (usize, QueryCapture<'a>)>,
+{
+    fn emit_event(
+        &mut self,
+        offset: usize,
+        event: Option<HighlightEvent>,
+    ) -> Option<Result<HighlightEvent, Error>> {
+        if self.byte_offset < offset {
+            let result = HighlightEvent::Source {
+                start: self.byte_offset,
+                end: offset,
+            };
+            self.byte_offset = offset;
+            // eprintln!("EVENT {}, {:?}", self.byte_offset, event);
+            self.next_event = event;
+            Some(Ok(result))
+        } else {
+            // eprintln!("EVENT {}, {:?}", self.byte_offset, event);
+            event.map(Ok)
+        }
+    }
+}
+
+impl<'a, F, C> Drop for HighlightIter<'a, F, C>
+where
+    F: Fn(&str) -> Option<&'a HighlightConfiguration> + 'a,
+    C: Iterator<Item = (usize, QueryCapture<'a>)>,
+{
+    fn drop(&mut self) {
+        if let Some(cursor) = self.cursor.take() {
+            self.context.cursors.push(cursor);
+        }
+    }
+}
+
+impl<'a, F, C> Iterator for HighlightIter<'a, F, C>
+where
+    F: Fn(&str) -> Option<&'a HighlightConfiguration> + 'a,
+    C: Iterator<Item = (usize, QueryCapture<'a>)>,
 {
     type Item = Result<HighlightEvent, Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(cancellation_flag) = self.cancellation_flag {
-            self.operation_count += 1;
-            if self.operation_count >= CANCELLATION_CHECK_INTERVAL {
-                self.operation_count = 0;
+            self.iter_count += 1;
+            if self.iter_count >= CANCELLATION_CHECK_INTERVAL {
+                self.iter_count = 0;
                 if cancellation_flag.load(Ordering::Relaxed) != 0 {
                     return Some(Err(Error::Cancelled));
                 }
             }
         }
 
-        while !self.layers.is_empty() {
-            let mut scope_event = None;
-            let first_layer = &self.layers[0];
+        if let Some(e) = self.next_event.take() {
+            return Some(Ok(e));
+        }
 
-            // If the current layer is not covered up by a nested layer, then
-            // process any scope boundaries and language injections for the layer's
-            // current position.
-            let first_layer_is_visible = first_layer.depth >= self.max_opaque_layer_depth;
-            if first_layer_is_visible {
-                let local_highlight = first_layer.local_highlight;
-                let properties = &first_layer.cursor.node_properties();
+        // Consume captures until one provides a highlight.
+        loop {
+            // Get the next capture. If there are no more, then emit the rest of the
+            // source code.
+            let (mut pattern_index, mut capture) = if let Some(c) = self.captures.peek() {
+                c.clone()
+            } else {
+                if let Some(end_byte) = self.highlight_end_stack.last().cloned() {
+                    self.highlight_end_stack.pop();
+                    return self.emit_event(end_byte, Some(HighlightEvent::HighlightEnd));
+                }
+                return self.emit_event(self.source.len(), None);
+            };
 
-                // Add any injections for the current node.
-                if !first_layer.at_node_end {
-                    let node = first_layer.cursor.node();
-                    let injections = properties
-                        .injections
-                        .iter()
-                        .filter_map(
-                            |Injection {
-                                 language,
-                                 content,
-                                 includes_children,
-                             }| {
-                                if let Some(language) =
-                                    self.injection_language_string(&node, language)
+            // If any previous highlight ends before this node starts, then before
+            // processing this capture, emit the source code up until the end of the
+            // previous highlight, and an end event for that highlight.
+            let range = capture.node.byte_range();
+            if let Some(end_byte) = self.highlight_end_stack.last().cloned() {
+                if end_byte <= range.start {
+                    self.highlight_end_stack.pop();
+                    return self.emit_event(end_byte, Some(HighlightEvent::HighlightEnd));
+                }
+            }
+            self.captures.next();
+
+            // Remove from the scope stack any local scopes that have already ended.
+            while range.start > self.scope_stack.last().unwrap().range.end {
+                self.scope_stack.pop();
+            }
+
+            // Process any local variable tracking patterns for this node.
+            let mut reference_highlight = None;
+            let mut definition_highlight = None;
+            while pattern_index < self.config.highlights_pattern_index {
+                // If the node represents a local scope, push a new local scope onto
+                // the scope stack.
+                if Some(capture.index) == self.local_scope_capture_index {
+                    definition_highlight = None;
+                    self.scope_stack.push(LocalScope {
+                        inherits: true,
+                        range: range.clone(),
+                        local_defs: Vec::new(),
+                    });
+                }
+                // If the node represents a definition, add a new definition to the
+                // local scope at the top of the scope stack.
+                else if Some(capture.index) == self.local_def_capture_index {
+                    reference_highlight = None;
+                    definition_highlight = None;
+                    let scope = self.scope_stack.last_mut().unwrap();
+                    if let Ok(name) = str::from_utf8(&self.source[range.clone()]) {
+                        scope.local_defs.push((name, None));
+                        definition_highlight = scope.local_defs.last_mut().map(|s| &mut s.1);
+                    }
+                }
+                // If the node represents a reference, then try to find the corresponding
+                // definition in the scope stack.
+                else if Some(capture.index) == self.local_ref_capture_index {
+                    if definition_highlight.is_none() {
+                        definition_highlight = None;
+                        if let Ok(name) = str::from_utf8(&self.source[range.clone()]) {
+                            for scope in self.scope_stack.iter().rev() {
+                                if let Some(highlight) =
+                                    scope.local_defs.iter().rev().find_map(|i| {
+                                        if i.0 == name {
+                                            Some(i.1)
+                                        } else {
+                                            None
+                                        }
+                                    })
                                 {
-                                    let nodes = self.nodes_for_tree_path(node, content);
-                                    let ranges = Self::intersect_ranges(
-                                        &first_layer.ranges,
-                                        &nodes,
-                                        *includes_children,
-                                    );
-                                    if ranges.len() > 0 {
-                                        return Some((language, ranges, *includes_children));
-                                    }
+                                    reference_highlight = highlight;
+                                    break;
                                 }
-                                None
-                            },
-                        )
-                        .collect::<Vec<_>>();
-
-                    let depth = first_layer.depth + 1;
-                    for (language, ranges, includes_children) in injections {
-                        if let Some(error) =
-                            self.add_layer(&language, ranges, depth, includes_children)
-                        {
-                            return Some(Err(error));
+                                if !scope.inherits {
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
 
-                // Determine if any scopes start or end at the current position.
-                let first_layer = &mut self.layers[0];
-                if let Some(highlight) = local_highlight
-                    .or(properties.highlight_nonlocal)
-                    .or(properties.highlight)
-                {
-                    let next_offset = cmp::min(self.source.len(), first_layer.offset());
-
-                    // Before returning any highlight boundaries, return any remaining slice of
-                    // the source code the precedes that highlight boundary.
-                    if self.source_offset < next_offset {
-                        return Some(Ok(self.emit_source(next_offset)));
+                // Continue processing any additional local-variable-tracking patterns
+                // for the same node.
+                if let Some((next_pattern_index, next_capture)) = self.captures.peek() {
+                    if next_capture.node == capture.node {
+                        pattern_index = *next_pattern_index;
+                        capture = next_capture.clone();
+                        self.captures.next();
+                        continue;
                     }
-
-                    scope_event = if first_layer.at_node_end {
-                        Some(Ok(HighlightEvent::HighlightEnd))
-                    } else {
-                        Some(Ok(HighlightEvent::HighlightStart(highlight)))
-                    };
                 }
+
+                break;
             }
 
-            // Advance the current layer's tree cursor. This might cause that cursor to move
-            // beyond one of the other layers' cursors for a different syntax tree, so we need
-            // to re-sort the layers. If the cursor is already at the end of its syntax tree,
-            // remove it.
-            if self.layers[0].advance() {
-                let mut index = 0;
-                while self.layers.get(index + 1).map_or(false, |next| {
-                    self.layers[index].cmp(next) == cmp::Ordering::Greater
-                }) {
-                    self.layers.swap(index, index + 1);
-                    index += 1;
-                }
-            } else {
-                self.remove_first_layer();
-            }
-
-            if scope_event.is_some() {
-                return scope_event;
-            }
-        }
-
-        if self.source_offset < self.source.len() {
-            Some(Ok(self.emit_source(self.source.len())))
-        } else {
-            None
-        }
-    }
-}
-
-impl<'a, T> fmt::Debug for Highlighter<'a, T>
-where
-    T: Fn(&str) -> Option<(Language, &'a PropertySheet<Properties>)>,
-{
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        if let Some(layer) = self.layers.first() {
-            let node = layer.cursor.node();
-            let position = if layer.at_node_end {
-                node.end_position()
-            } else {
-                node.start_position()
-            };
-            write!(
-                f,
-                "{{Highlighter position: {:?}, kind: {}, at_end: {}, props: {:?}}}",
-                position,
-                node.kind(),
-                layer.at_node_end,
-                layer.cursor.node_properties()
-            )?;
-        }
-        Ok(())
-    }
-}
-
-impl<'a> Layer<'a> {
-    fn new(
-        source: &'a [u8],
-        tree: Tree,
-        sheet: &'a PropertySheet<Properties>,
-        ranges: Vec<Range>,
-        depth: usize,
-        opaque: bool,
-    ) -> Self {
-        // The cursor's lifetime parameter indicates that the tree must outlive the cursor.
-        // But because the tree is really a pointer to the heap, the cursor can remain
-        // valid when the tree is moved. There's no way to express this with lifetimes
-        // right now, so we have to `transmute` the cursor's lifetime.
-        let cursor = unsafe { transmute(tree.walk_with_properties(sheet, source)) };
-        Self {
-            _tree: tree,
-            cursor,
-            ranges,
-            depth,
-            opaque,
-            at_node_end: false,
-            scope_stack: vec![Scope {
-                inherits: false,
-                local_defs: Vec::new(),
-            }],
-            local_highlight: None,
-        }
-    }
-
-    fn cmp(&self, other: &Layer) -> cmp::Ordering {
-        // Events are ordered primarily by their position in the document. But if
-        // one highlight starts at a given position and another highlight ends at that
-        // same position, return the highlight end event before the highlight start event.
-        self.offset()
-            .cmp(&other.offset())
-            .then_with(|| other.at_node_end.cmp(&self.at_node_end))
-            .then_with(|| self.depth.cmp(&other.depth))
-    }
-
-    fn offset(&self) -> usize {
-        if self.at_node_end {
-            self.cursor.node().end_byte()
-        } else {
-            self.cursor.node().start_byte()
-        }
-    }
-
-    fn advance(&mut self) -> bool {
-        // Clear the current local highlighting class, which may be re-populated
-        // if we enter a node that represents a local definition or local reference.
-        self.local_highlight = None;
-
-        // Step through the tree in a depth-first traversal, stopping at both
-        // the start and end position of every node.
-        if self.at_node_end {
-            self.leave_node();
-            if self.cursor.goto_next_sibling() {
-                self.enter_node();
-                self.at_node_end = false;
-            } else if !self.cursor.goto_parent() {
-                return false;
-            }
-        } else if self.cursor.goto_first_child() {
-            self.enter_node();
-        } else {
-            self.at_node_end = true;
-        }
-        true
-    }
-
-    fn enter_node(&mut self) {
-        let node = self.cursor.node();
-        let props = self.cursor.node_properties();
-        let node_text = if props.local_definition || props.local_reference {
-            node.utf8_text(self.cursor.source()).ok()
-        } else {
-            None
-        };
-
-        // If this node represents a local definition, then record its highlighting class
-        // and store the highlighting class in the current local scope.
-        if props.local_definition {
-            if let (Some(text), Some(inner_scope), Some(highlight)) =
-                (node_text, self.scope_stack.last_mut(), props.highlight)
+            // If the current node was found to be a local variable, then skip over any
+            // highlighting patterns that are disabled for local variables.
+            let mut has_highlight = true;
+            while (definition_highlight.is_some() || reference_highlight.is_some())
+                && self.config.non_local_variable_patterns[pattern_index]
             {
-                self.local_highlight = props.highlight;
-                if let Err(i) = inner_scope.local_defs.binary_search_by_key(&text, |e| e.0) {
-                    inner_scope.local_defs.insert(i, (text, highlight));
-                }
-            }
-        }
-        // If this node represents a local reference, then look it up in the current scope
-        // stack. If a local definition is found, record its highlighting class.
-        else if props.local_reference {
-            if let Some(text) = node_text {
-                for scope in self.scope_stack.iter().rev() {
-                    if let Ok(i) = scope.local_defs.binary_search_by_key(&text, |e| e.0) {
-                        self.local_highlight = Some(scope.local_defs[i].1);
-                        break;
-                    }
-                    if !scope.inherits {
-                        break;
+                has_highlight = false;
+                if let Some((next_pattern_index, next_capture)) = self.captures.peek() {
+                    if next_capture.node == capture.node {
+                        pattern_index = *next_pattern_index;
+                        capture = next_capture.clone();
+                        has_highlight = true;
+                        self.captures.next();
+                        continue;
                     }
                 }
+                break;
+            }
+            if !has_highlight {
+                continue;
+            }
+
+            // Once a highlighting pattern is found for the current node, skip over
+            // any later highlighting patterns that also match this node.
+            while let Some((_, next_capture)) = self.captures.peek() {
+                if next_capture.node == capture.node {
+                    self.captures.next();
+                } else {
+                    break;
+                }
+            }
+
+            let current_highlight = self.config.highlight_indices[capture.index];
+
+            if let Some(definition_highlight) = definition_highlight {
+                *definition_highlight = current_highlight;
+            }
+
+            if let Some(highlight) = reference_highlight.or(current_highlight) {
+                self.highlight_end_stack.push(range.end);
+                return self
+                    .emit_event(range.start, Some(HighlightEvent::HighlightStart(highlight)));
             }
         }
-        // If this node represents a new local scope, then push it onto the scope stack.
-        if let Some(inherits) = props.local_scope {
-            self.scope_stack.push(Scope {
-                inherits,
-                local_defs: Vec::new(),
-            });
-        }
     }
-
-    fn leave_node(&mut self) {
-        let props = self.cursor.node_properties();
-        if props.local_scope.is_some() {
-            self.scope_stack.pop();
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for Highlight {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        match s.as_str() {
-            "attribute" => Ok(Highlight::Attribute),
-            "comment" => Ok(Highlight::Comment),
-            "constant" => Ok(Highlight::Constant),
-            "constant.builtin" => Ok(Highlight::ConstantBuiltin),
-            "constructor" => Ok(Highlight::Constructor),
-            "constructor.builtin" => Ok(Highlight::ConstructorBuiltin),
-            "embedded" => Ok(Highlight::Embedded),
-            "escape" => Ok(Highlight::Escape),
-            "function" => Ok(Highlight::Function),
-            "function.builtin" => Ok(Highlight::FunctionBuiltin),
-            "keyword" => Ok(Highlight::Keyword),
-            "number" => Ok(Highlight::Number),
-            "operator" => Ok(Highlight::Operator),
-            "property" => Ok(Highlight::Property),
-            "property.builtin" => Ok(Highlight::PropertyBuiltin),
-            "punctuation" => Ok(Highlight::Punctuation),
-            "punctuation.bracket" => Ok(Highlight::PunctuationBracket),
-            "punctuation.delimiter" => Ok(Highlight::PunctuationDelimiter),
-            "punctuation.special" => Ok(Highlight::PunctuationSpecial),
-            "string" => Ok(Highlight::String),
-            "string.special" => Ok(Highlight::StringSpecial),
-            "type" => Ok(Highlight::Type),
-            "type.builtin" => Ok(Highlight::TypeBuiltin),
-            "variable" => Ok(Highlight::Variable),
-            "variable.builtin" => Ok(Highlight::VariableBuiltin),
-            "variable.parameter" => Ok(Highlight::VariableParameter),
-            "tag" => Ok(Highlight::Tag),
-            _ => Ok(Highlight::Unknown),
-        }
-    }
-}
-
-impl Serialize for Highlight {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        match self {
-            Highlight::Attribute => serializer.serialize_str("attribute"),
-            Highlight::Comment => serializer.serialize_str("comment"),
-            Highlight::Constant => serializer.serialize_str("constant"),
-            Highlight::ConstantBuiltin => serializer.serialize_str("constant.builtin"),
-            Highlight::Constructor => serializer.serialize_str("constructor"),
-            Highlight::ConstructorBuiltin => serializer.serialize_str("constructor.builtin"),
-            Highlight::Embedded => serializer.serialize_str("embedded"),
-            Highlight::Escape => serializer.serialize_str("escape"),
-            Highlight::Function => serializer.serialize_str("function"),
-            Highlight::FunctionBuiltin => serializer.serialize_str("function.builtin"),
-            Highlight::Keyword => serializer.serialize_str("keyword"),
-            Highlight::Number => serializer.serialize_str("number"),
-            Highlight::Operator => serializer.serialize_str("operator"),
-            Highlight::Property => serializer.serialize_str("property"),
-            Highlight::PropertyBuiltin => serializer.serialize_str("property.builtin"),
-            Highlight::Punctuation => serializer.serialize_str("punctuation"),
-            Highlight::PunctuationBracket => serializer.serialize_str("punctuation.bracket"),
-            Highlight::PunctuationDelimiter => serializer.serialize_str("punctuation.delimiter"),
-            Highlight::PunctuationSpecial => serializer.serialize_str("punctuation.special"),
-            Highlight::String => serializer.serialize_str("string"),
-            Highlight::StringSpecial => serializer.serialize_str("string.special"),
-            Highlight::Type => serializer.serialize_str("type"),
-            Highlight::TypeBuiltin => serializer.serialize_str("type.builtin"),
-            Highlight::Variable => serializer.serialize_str("variable"),
-            Highlight::VariableBuiltin => serializer.serialize_str("variable.builtin"),
-            Highlight::VariableParameter => serializer.serialize_str("variable.parameter"),
-            Highlight::Tag => serializer.serialize_str("tag"),
-            Highlight::Unknown => serializer.serialize_str(""),
-        }
-    }
-}
-
-pub trait HTMLAttributeCallback<'a>: Fn(Highlight) -> &'a str {}
-
-pub fn highlight<'a, F>(
-    source: &'a [u8],
-    language: Language,
-    property_sheet: &'a PropertySheet<Properties>,
-    cancellation_flag: Option<&'a AtomicUsize>,
-    injection_callback: F,
-) -> Result<impl Iterator<Item = Result<HighlightEvent, Error>> + 'a, Error>
-where
-    F: Fn(&str) -> Option<(Language, &'a PropertySheet<Properties>)> + 'a,
-{
-    Highlighter::new(
-        source,
-        language,
-        property_sheet,
-        injection_callback,
-        cancellation_flag,
-    )
-}
-
-pub fn highlight_html<'a, F1, F2>(
-    source: &'a [u8],
-    language: Language,
-    property_sheet: &'a PropertySheet<Properties>,
-    cancellation_flag: Option<&'a AtomicUsize>,
-    injection_callback: F1,
-    attribute_callback: F2,
-) -> Result<Vec<String>, Error>
-where
-    F1: Fn(&str) -> Option<(Language, &'a PropertySheet<Properties>)>,
-    F2: Fn(Highlight) -> &'a str,
-{
-    let mut renderer = HtmlRenderer::new();
-    renderer.render(
-        Highlighter::new(
-            source,
-            language,
-            property_sheet,
-            injection_callback,
-            cancellation_flag,
-        )?,
-        source,
-        &|s| (attribute_callback)(s).as_bytes(),
-    )?;
-    Ok(renderer
-        .line_offsets
-        .iter()
-        .enumerate()
-        .map(|(i, offset)| {
-            let offset = *offset as usize;
-            let next_offset = renderer
-                .line_offsets
-                .get(i + 1)
-                .map_or(renderer.html.len(), |i| *i as usize);
-            String::from_utf8(renderer.html[offset..next_offset].to_vec()).unwrap()
-        })
-        .collect())
 }
 
 pub struct HtmlRenderer {
@@ -1114,7 +437,7 @@ pub struct HtmlRenderer {
 }
 
 impl HtmlRenderer {
-    fn new() -> Self {
+    pub fn new() -> Self {
         HtmlRenderer {
             html: Vec::new(),
             line_offsets: vec![0],
@@ -1160,6 +483,21 @@ impl HtmlRenderer {
             self.line_offsets.pop();
         }
         Ok(())
+    }
+
+    pub fn lines(&self) -> impl Iterator<Item = &str> {
+        self.line_offsets
+            .iter()
+            .enumerate()
+            .map(move |(i, line_start)| {
+                let line_start = *line_start as usize;
+                let line_end = if i + 1 == self.line_offsets.len() {
+                    self.html.len()
+                } else {
+                    self.line_offsets[i + 1] as usize
+                };
+                str::from_utf8(&self.html[line_start..line_end]).unwrap()
+            })
     }
 
     fn start_highlight<'a, F>(&mut self, h: Highlight, attribute_callback: &F)
