@@ -985,7 +985,11 @@ fn collect_matches<'a>(
         .map(|m| {
             (
                 m.pattern_index,
-                collect_captures(m.captures().map(|c| (m.pattern_index, c)), query, source),
+                collect_captures(
+                    m.captures.iter().map(|c| (m.pattern_index, *c)),
+                    query,
+                    source,
+                ),
             )
         })
         .collect()
@@ -999,7 +1003,7 @@ fn collect_captures<'a, 'b>(
     captures
         .map(|(_, QueryCapture { index, node })| {
             (
-                query.capture_names()[index].as_str(),
+                query.capture_names()[index as usize].as_str(),
                 node.utf8_text(source.as_bytes()).unwrap(),
             )
         })

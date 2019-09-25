@@ -41,7 +41,7 @@ pub fn query_files_at_paths(
                     &mut stdout,
                     "    pattern: {}, capture: {}, row: {}, text: {:?}",
                     pattern_index,
-                    &query.capture_names()[capture.index],
+                    &query.capture_names()[capture.index as usize],
                     capture.node.start_position().row,
                     capture.node.utf8_text(&source_code).unwrap_or("")
                 )?;
@@ -49,11 +49,11 @@ pub fn query_files_at_paths(
         } else {
             for m in query_cursor.matches(&query, tree.root_node(), text_callback) {
                 writeln!(&mut stdout, "  pattern: {}", m.pattern_index)?;
-                for capture in m.captures() {
+                for capture in m.captures {
                     writeln!(
                         &mut stdout,
                         "    capture: {}, row: {}, text: {:?}",
-                        &query.capture_names()[capture.index],
+                        &query.capture_names()[capture.index as usize],
                         capture.node.start_position().row,
                         capture.node.utf8_text(&source_code).unwrap_or("")
                     )?;

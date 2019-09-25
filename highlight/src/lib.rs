@@ -66,9 +66,9 @@ where
     injection_callback: F,
     byte_offset: usize,
     iter_count: usize,
-    local_scope_capture_index: Option<usize>,
-    local_def_capture_index: Option<usize>,
-    local_ref_capture_index: Option<usize>,
+    local_scope_capture_index: Option<u32>,
+    local_def_capture_index: Option<u32>,
+    local_ref_capture_index: Option<u32>,
     highlight_end_stack: Vec<usize>,
     scope_stack: Vec<LocalScope<'a>>,
     next_event: Option<HighlightEvent>,
@@ -202,10 +202,20 @@ impl Highlighter {
             })
             .peekable();
 
+        let mut local_scope_capture_index = None;
+        let mut local_def_capture_index = None;
+        let mut local_ref_capture_index = None;
+        for (i, name) in capture_names.iter().enumerate() {
+            let i = Some(i as u32);
+            match name.as_str() {
+                "local.scope" => local_scope_capture_index = i,
+                "local.definition" => local_def_capture_index = i,
+                "local.reference" => local_ref_capture_index = i,
+                _ => {}
+            }
+        }
+
         Ok(HighlightIter {
-            local_scope_capture_index: capture_names.iter().position(|c| c == "local.scope"),
-            local_def_capture_index: capture_names.iter().position(|c| c == "local.definition"),
-            local_ref_capture_index: capture_names.iter().position(|c| c == "local.reference"),
             byte_offset: 0,
             iter_count: 0,
             next_event: None,
@@ -217,6 +227,9 @@ impl Highlighter {
             }],
             cursor: Some(cursor),
             _tree: tree,
+            local_scope_capture_index,
+            local_def_capture_index,
+            local_ref_capture_index,
             captures,
             cancellation_flag,
             source,
@@ -416,7 +429,7 @@ where
                 }
             }
 
-            let current_highlight = self.config.highlight_indices[capture.index];
+            let current_highlight = self.config.highlight_indices[capture.index as usize];
 
             if let Some(definition_highlight) = definition_highlight {
                 *definition_highlight = current_highlight;

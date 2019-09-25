@@ -122,6 +122,7 @@ pub struct PropertySheetJSON<P> {
 }
 
 #[derive(Clone, Copy)]
+#[repr(transparent)]
 pub struct Node<'a>(ffi::TSNode, PhantomData<&'a ()>);
 
 pub struct Parser(NonNull<ffi::TSParser>);
@@ -165,13 +166,14 @@ pub struct QueryCursor(NonNull<ffi::TSQueryCursor>);
 
 pub struct QueryMatch<'a> {
     pub pattern_index: usize,
-    captures: &'a [ffi::TSQueryCapture],
+    pub captures: &'a [QueryCapture<'a>],
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
+#[repr(C)]
 pub struct QueryCapture<'a> {
-    pub index: usize,
     pub node: Node<'a>,
+    pub index: u32,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1273,7 +1275,7 @@ impl QueryCursor {
                     let mut m = MaybeUninit::<ffi::TSQueryMatch>::uninit();
                     if ffi::ts_query_cursor_next_match(ptr, m.as_mut_ptr()) {
                         let m = m.assume_init();
-                        let captures = slice::from_raw_parts(m.captures, m.capture_count as usize);
+                        let captures = slice::from_raw_parts(m.captures as *const QueryCapture<'a>, m.capture_count as usize);
                         if Self::captures_match_text_predicates(
                             query,
                             captures,
@@ -1311,21 +1313,14 @@ impl QueryCursor {
                     &mut capture_index as *mut u32,
                 ) {
                     let m = m.assume_init();
-                    let captures = slice::from_raw_parts(m.captures, m.capture_count as usize);
+                    let captures = slice::from_raw_parts(m.captures as *const QueryCapture<'a>, m.capture_count as usize);
                     if Self::captures_match_text_predicates(
                         query,
                         captures,
                         m.pattern_index as usize,
                         &mut text_callback,
                     ) {
-                        let capture = captures[capture_index as usize];
-                        return Some((
-                            m.pattern_index as usize,
-                            QueryCapture {
-                                index: capture.index as usize,
-                                node: Node::new(capture.node).unwrap(),
-                            },
-                        ));
+                        return Some((m.pattern_index as usize, captures[capture_index as usize]));
                     }
                 } else {
                     return None;
@@ -1336,7 +1331,7 @@ impl QueryCursor {
 
     fn captures_match_text_predicates<'a>(
         query: &'a Query,
-        captures: &'a [ffi::TSQueryCapture],
+        captures: &'a [QueryCapture],
         pattern_index: usize,
         text_callback: &mut impl FnMut(Node<'a>) -> &'a [u8],
     ) -> bool {
@@ -1359,10 +1354,10 @@ impl QueryCursor {
             })
     }
 
-    fn capture_for_id(captures: &[ffi::TSQueryCapture], capture_id: u32) -> Option<Node> {
+    fn capture_for_id<'a>(captures: &'a [QueryCapture<'a>], capture_id: u32) -> Option<Node<'a>> {
         for c in captures {
             if c.index == capture_id {
-                return Node::new(c.node);
+                return Some(c.node);
             }
         }
         None
@@ -1380,15 +1375,6 @@ impl QueryCursor {
             ffi::ts_query_cursor_set_point_range(self.0.as_ptr(), start.into(), end.into());
         }
         self
-    }
-}
-
-impl<'a> QueryMatch<'a> {
-    pub fn captures(&self) -> impl ExactSizeIterator<Item = QueryCapture> {
-        self.captures.iter().map(|capture| QueryCapture {
-            index: capture.index as usize,
-            node: Node::new(capture.node).unwrap(),
-        })
     }
 }
 
