@@ -34,13 +34,14 @@ pub fn query_files_at_paths(
         let tree = parser.parse(&source_code, None).unwrap();
 
         if ordered_captures {
-            for (pattern_index, capture) in
+            for (mat, capture_index) in
                 query_cursor.captures(&query, tree.root_node(), text_callback)
             {
+                let capture = mat.captures[capture_index];
                 writeln!(
                     &mut stdout,
                     "    pattern: {}, capture: {}, row: {}, text: {:?}",
-                    pattern_index,
+                    mat.pattern_index,
                     &query.capture_names()[capture.index as usize],
                     capture.node.start_position().row,
                     capture.node.utf8_text(&source_code).unwrap_or("")

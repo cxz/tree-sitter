@@ -4,7 +4,7 @@ pub use c_lib as c;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{iter, mem, ops, str, usize};
-use tree_sitter::{Language, Parser, Query, QueryCapture, QueryCursor, QueryError, Tree};
+use tree_sitter::{Language, Parser, Query, QueryCursor, QueryError, QueryMatch, Tree};
 
 const CANCELLATION_CHECK_INTERVAL: usize = 100;
 
@@ -54,7 +54,7 @@ pub struct HighlightContext {
 struct HighlightIter<'a, F, C>
 where
     F: Fn(&str) -> Option<&'a HighlightConfiguration> + 'a,
-    C: Iterator<Item = (usize, QueryCapture<'a>)>,
+    C: Iterator<Item = (QueryMatch<'a>, usize)>,
 {
     context: &'a mut HighlightContext,
     _tree: Tree,
@@ -243,7 +243,7 @@ impl Highlighter {
 impl<'a, F, C> HighlightIter<'a, F, C>
 where
     F: Fn(&str) -> Option<&'a HighlightConfiguration> + 'a,
-    C: Iterator<Item = (usize, QueryCapture<'a>)>,
+    C: Iterator<Item = (QueryMatch<'a>, usize)>,
 {
     fn emit_event(
         &mut self,
@@ -269,7 +269,7 @@ where
 impl<'a, F, C> Drop for HighlightIter<'a, F, C>
 where
     F: Fn(&str) -> Option<&'a HighlightConfiguration> + 'a,
-    C: Iterator<Item = (usize, QueryCapture<'a>)>,
+    C: Iterator<Item = (QueryMatch<'a>, usize)>,
 {
     fn drop(&mut self) {
         if let Some(cursor) = self.cursor.take() {
@@ -281,7 +281,7 @@ where
 impl<'a, F, C> Iterator for HighlightIter<'a, F, C>
 where
     F: Fn(&str) -> Option<&'a HighlightConfiguration> + 'a,
-    C: Iterator<Item = (usize, QueryCapture<'a>)>,
+    C: Iterator<Item = (QueryMatch<'a>, usize)>,
 {
     type Item = Result<HighlightEvent, Error>;
 
@@ -304,7 +304,7 @@ where
         loop {
             // Get the next capture. If there are no more, then emit the rest of the
             // source code.
-            let (mut pattern_index, mut capture) = if let Some(c) = self.captures.peek() {
+            let (query_match, capture_index) = if let Some(c) = self.captures.peek() {
                 c.clone()
             } else {
                 if let Some(end_byte) = self.highlight_end_stack.last().cloned() {
@@ -313,6 +313,9 @@ where
                 }
                 return self.emit_event(self.source.len(), None);
             };
+
+            let mut capture = query_match.captures[capture_index];
+            let mut pattern_index = query_match.pattern_index;
 
             // If any previous highlight ends before this node starts, then before
             // processing this capture, emit the source code up until the end of the
@@ -385,9 +388,10 @@ where
 
                 // Continue processing any additional local-variable-tracking patterns
                 // for the same node.
-                if let Some((next_pattern_index, next_capture)) = self.captures.peek() {
+                if let Some((next_match, next_capture_index)) = self.captures.peek() {
+                    let next_capture = next_match.captures[*next_capture_index];
                     if next_capture.node == capture.node {
-                        pattern_index = *next_pattern_index;
+                        pattern_index = next_match.pattern_index;
                         capture = next_capture.clone();
                         self.captures.next();
                         continue;
@@ -404,9 +408,10 @@ where
                 && self.config.non_local_variable_patterns[pattern_index]
             {
                 has_highlight = false;
-                if let Some((next_pattern_index, next_capture)) = self.captures.peek() {
+                if let Some((next_match, next_capture_index)) = self.captures.peek() {
+                    let next_capture = next_match.captures[*next_capture_index];
                     if next_capture.node == capture.node {
-                        pattern_index = *next_pattern_index;
+                        pattern_index = next_match.pattern_index;
                         capture = next_capture.clone();
                         has_highlight = true;
                         self.captures.next();
@@ -421,8 +426,8 @@ where
 
             // Once a highlighting pattern is found for the current node, skip over
             // any later highlighting patterns that also match this node.
-            while let Some((_, next_capture)) = self.captures.peek() {
-                if next_capture.node == capture.node {
+            while let Some((next_match, capture_index)) = self.captures.peek() {
+                if next_match.captures[*capture_index].node == capture.node {
                     self.captures.next();
                 } else {
                     break;
