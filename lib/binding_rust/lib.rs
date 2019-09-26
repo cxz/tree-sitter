@@ -24,7 +24,7 @@ use std::{char, fmt, ptr, slice, str, u16};
 pub const LANGUAGE_VERSION: usize = ffi::TREE_SITTER_LANGUAGE_VERSION;
 pub const PARSER_HEADER: &'static str = include_str!("../include/tree_sitter/parser.h");
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(transparent)]
 pub struct Language(*const ffi::TSLanguage);
 
@@ -170,6 +170,12 @@ pub struct QueryMatch<'a> {
     pub captures: &'a [QueryCapture<'a>],
     id: u32,
     cursor: *mut ffi::TSQueryCursor,
+}
+
+pub struct QueryCaptures<'a> {
+    ptr: *mut ffi::TSQueryCursor,
+    query: &'a Query,
+    text_callback: Box<dyn FnMut(Node<'a>) -> &'a [u8] + 'a>,
 }
 
 #[derive(Clone, Copy)]
@@ -1281,30 +1287,15 @@ impl QueryCursor {
         &'a mut self,
         query: &'a Query,
         node: Node<'a>,
-        mut text_callback: impl FnMut(Node<'a>) -> &'a [u8] + 'a,
-    ) -> impl Iterator<Item = (QueryMatch<'a>, usize)> + 'a {
+        text_callback: impl FnMut(Node<'a>) -> &'a [u8] + 'a,
+    ) -> QueryCaptures<'a> {
         let ptr = self.0.as_ptr();
         unsafe { ffi::ts_query_cursor_exec(ptr, query.ptr.as_ptr(), node.0) };
-        std::iter::from_fn(move || loop {
-            unsafe {
-                let mut capture_index = 0u32;
-                let mut m = MaybeUninit::<ffi::TSQueryMatch>::uninit();
-                if ffi::ts_query_cursor_next_capture(
-                    ptr,
-                    m.as_mut_ptr(),
-                    &mut capture_index as *mut u32,
-                ) {
-                    let result = QueryMatch::new(m.assume_init(), ptr);
-                    if result.satisfies_text_predicates(query, &mut text_callback) {
-                        return Some((result, capture_index as usize));
-                    } else {
-                        result.remove();
-                    }
-                } else {
-                    return None;
-                }
-            }
-        })
+        QueryCaptures {
+            ptr,
+            query,
+            text_callback: Box::new(text_callback),
+        }
     }
 
     pub fn set_byte_range(&mut self, start: usize, end: usize) -> &mut Self {
@@ -1381,6 +1372,33 @@ impl QueryProperty {
             capture_id,
             key: key.to_string().into_boxed_str(),
             value: value.map(|s| s.to_string().into_boxed_str()),
+        }
+    }
+}
+
+impl<'a> Iterator for QueryCaptures<'a> {
+    type Item = (QueryMatch<'a>, usize);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            unsafe {
+                let mut capture_index = 0u32;
+                let mut m = MaybeUninit::<ffi::TSQueryMatch>::uninit();
+                if ffi::ts_query_cursor_next_capture(
+                    self.ptr,
+                    m.as_mut_ptr(),
+                    &mut capture_index as *mut u32,
+                ) {
+                    let result = QueryMatch::new(m.assume_init(), self.ptr);
+                    if result.satisfies_text_predicates(self.query, &mut self.text_callback) {
+                        return Some((result, capture_index as usize));
+                    } else {
+                        result.remove();
+                    }
+                } else {
+                    return None;
+                }
+            }
         }
     }
 }

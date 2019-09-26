@@ -16,6 +16,7 @@ lazy_static! {
     static ref RUST_HIGHLIGHT: HighlightConfiguration = get_highlight_config("rust", &HIGHLIGHTER);
     static ref HIGHLIGHTER: Highlighter = Highlighter::new(
         [
+            "attribute",
             "constructor",
             "function.builtin",
             "function",
@@ -26,6 +27,7 @@ lazy_static! {
             "punctuation",
             "punctuation.bracket",
             "punctuation.delimiter",
+            "tag",
             "type.builtin",
             "type",
             "variable.builtin",
@@ -92,9 +94,10 @@ fn test_highlighting_injected_html_in_javascript() {
             (" ", vec![]),
             ("html", vec!["function"]),
             (" ", vec![]),
-            ("`<", vec!["string"]),
+            ("`", vec!["string"]),
+            ("<", vec!["string", "punctuation.bracket"]),
             ("div", vec!["string", "tag"]),
-            (">", vec!["string"]),
+            (">", vec!["string", "punctuation.bracket"]),
             ("${", vec!["string", "embedded", "punctuation.special"]),
             ("a", vec!["string", "embedded", "variable"]),
             (" ", vec!["string", "embedded"]),
@@ -102,11 +105,43 @@ fn test_highlighting_injected_html_in_javascript() {
             (" ", vec!["string", "embedded"]),
             ("b", vec!["string", "embedded", "variable"]),
             ("}", vec!["string", "embedded", "punctuation.special"]),
-            ("</", vec!["string"]),
+            ("</", vec!["string", "punctuation.bracket"]),
             ("div", vec!["string", "tag"]),
-            (">`", vec!["string"]),
+            (">`", vec!["string", "punctuation.bracket"]),
             (";", vec!["punctuation.delimitere"]),
         ]]
+    );
+}
+
+#[test]
+fn test_highlighting_injected_javascript_in_html_mini() {
+    let source = "<script>const x = new Thing();</script>";
+
+    eprintln!("HTML {:?}", HTML_HIGHLIGHT.language);
+    eprintln!("JavaScript {:?}", JS_HIGHLIGHT.language);
+
+    assert_eq!(
+        &to_token_vector(source, &HTML_HIGHLIGHT).unwrap(),
+        &[vec![
+            ("<", vec!["punctuation.bracket"]),
+            ("script", vec!["tag"]),
+            (">", vec!["punctuation.bracket"]),
+            ("const", vec!["keyword"]),
+            (" ", vec![]),
+            ("x", vec!["variable"]),
+            (" ", vec![]),
+            ("=", vec!["operator"]),
+            (" ", vec![]),
+            ("new", vec!["keyword"]),
+            (" ", vec![]),
+            ("Thing", vec!["constructor"]),
+            ("(", vec!["punctuation.bracket"]),
+            (")", vec!["punctuation.bracket"]),
+            (";", vec!["punctuation.delimiter"]),
+            ("</", vec!["punctuation.bracket"]),
+            ("script", vec!["tag"]),
+            (">", vec!["punctuation.bracket"]),
+        ],]
     );
 }
 
@@ -124,8 +159,17 @@ fn test_highlighting_injected_javascript_in_html() {
     assert_eq!(
         &to_token_vector(&source, &HTML_HIGHLIGHT).unwrap(),
         &[
-            vec![("<", vec![]), ("body", vec!["tag"]), (">", vec![]),],
-            vec![("  <", vec![]), ("script", vec!["tag"]), (">", vec![]),],
+            vec![
+                ("<", vec!["punctuation.bracket"]),
+                ("body", vec!["tag"]),
+                (">", vec!["punctuation.bracket"]),
+            ],
+            vec![
+                ("  ", vec![]),
+                ("<", vec!["punctuation.bracket"]),
+                ("script", vec!["tag"]),
+                (">", vec!["punctuation.bracket"]),
+            ],
             vec![
                 ("    ", vec![]),
                 ("const", vec!["keyword"]),
@@ -141,8 +185,17 @@ fn test_highlighting_injected_javascript_in_html() {
                 (")", vec!["punctuation.bracket"]),
                 (";", vec!["punctuation.delimiter"]),
             ],
-            vec![("  </", vec![]), ("script", vec!["tag"]), (">", vec![]),],
-            vec![("</", vec![]), ("body", vec!["tag"]), (">", vec![]),],
+            vec![
+                ("  ", vec![]),
+                ("</", vec!["punctuation.bracket"]),
+                ("script", vec!["tag"]),
+                (">", vec!["punctuation.bracket"]),
+            ],
+            vec![
+                ("</", vec!["punctuation.bracket"]),
+                ("body", vec!["tag"]),
+                (">", vec!["punctuation.bracket"]),
+            ],
         ]
     );
 }
